@@ -10,11 +10,10 @@ import oauth2client
 from oauth2client import client
 from oauth2client import tools
 import os
-import cPickle as pickle
 
 
 # If modifying these scopes, delete your previously saved credentials
-# at ./.credentials/drive-python-quickstart.json
+# at ./.credentials/GdriveOrphans-Creds.json
 SCOPES = 'https://www.googleapis.com/auth/drive'
 CLIENT_SECRET_FILE = 'client_secret.json'
 APPLICATION_NAME = 'GDriveOrphans'
@@ -27,100 +26,88 @@ class DriveCleaner():
         self.moved = 0
         self.trashed = 0
         self.errors = 0
-        self.files = []
+        self.orphans = []
 
     def __str__(self):
         return 'This session, ' + str(self.moved) + ' moved, ' + str(self.trashed) + ' trashed, ' + str(
             self.errors) + ' errors, with ' + str(self.total) + ' files currently listed'
 
-    def updateFiles(self):
+    def findOrphans(self):
         keep_going = True
         next_token = None
-        self.files = []
+        self.orphans = []
         self.requests = 0
         self.total = 0
-        
-        try:
-            os.remove('fileList.pkl')
-        except OSError:
-            pass
         
         while keep_going:
             self.requests += 1
             print 'Making request ' + str(self.requests) + ' total files ' + str(self.total)
-            f = self.drive.files().list(maxResults=1000, pageToken=next_token).execute()
+            f = None
+            try:
+                f = self.drive.files().list(maxResults=1000, pageToken=next_token).execute()
+            except errors.HttpError, error:
+                print 'HTTP Error Code %s Retrying...' % error.resp.status
+                continue
             try:
                 next_token = f['nextPageToken']
             except KeyError:
                 next_token = None
                 keep_going = False
             self.total += len(f['items'])
-            pf = open('fileList.pkl', 'ab')
-            pickler = pickle.Pickler(pf)
-            pickler.dump(f['items'])
-            pf.close()
-        print str(self)
+            
+            # look for no parents
+            self.orphans = self.orphans + self.noParentsMine(f['items'])
+            
+            # look for dead parents
+            self.orphans = self.orphans + self.deadParentsMine(f['items'])
+            
+            print 'Orphan Count: ' + str(len(self.orphans))
 
-    def noParents(self):
-        no_parents = []
-        while(1):
-            pf = open('fileList.pkl', 'rb')
-            unpickler = pickle.Unpickler(pf)
-            files = unpickler.load()
-            for file in files: 
-               if len(file['parents']) == 0]:
-                   no_parents.extend(file)
-        pf.close()                   
-        return no_parents
+    def noParents(self, file_list):
+        return [x for x in file_list if len(x['parents']) == 0];
 
-    def noParentsMine(self):
-        return [x for x in self.noParents() if
+    def noParentsMine(self, file_list):
+        return [x for x in self.noParents(file_list) if
                 len(x['owners']) == 1 and x['owners'][0]['isAuthenticatedUser']]
                 
-    def deadParentsMine (self):
+    def deadParentsMine (self, file_list):
         # look for files whose parents return a 404
         dead_parents = []
-        while(1):
-            pf = open('fileList.pkl', 'rb')
-            unpickler = pickle.Unpickler(pf)
-            files = unpickler.load()
-            for file in files: 
-                if len(file['owners']) == 1 and file['owners'][0]['isAuthenticatedUser']:
-                    dead_parent_count = 0
-                    for parent in file['parents']:
-                        try:
-                            self.drive.files().get(fileId=parent['id']).execute()
-                        except errors.HttpError, error:
-                            if error.resp.status == 404:
-                                if file['labels'] and file['labels']['trashed']:
-                                    pass
-                                else:
-                                    dead_parent_count += 1
-                    # if the parent count matches dead_parent_count, all parents are dead
-                    if len(file['parents']) == dead_parent_count:
-                        dead_parents.extend(file)
-                        print 'File %s has dead parents' % file['title']
-            pf.close()
+        for file in file_list: 
+            if len(file['owners']) == 1 and file['owners'][0]['isAuthenticatedUser']:
+                dead_parent_count = 0
+                for parent in file['parents']:
+                    try:
+                        self.drive.files().get(fileId=parent['id']).execute()
+                    except errors.HttpError, error:
+                        if error.resp.status == 404:
+                            if file['labels'] and file['labels']['trashed']:
+                                pass
+                            else:
+                                dead_parent_count += 1
+                # if the parent count matches dead_parent_count, all parents are dead
+                if len(file['parents']) == dead_parent_count:
+                    dead_parents.append(file)
+                    print 'File %s has dead parents' % file['title']
         return dead_parents             
 
     def trashItems(self, reload_files=False):
-        if len(self.files) == 0 or reload_files:
-            self.updateFiles()
+        if len(self.orphans) == 0 or reload_files:
+            self.findOrphans()
         # find items we want to trash
-        for item in self.noParentsMine() + self.deadParentsMine():
+        for item in self.orphans:
             # ... check to see if already trashed
             if item['labels'] and item['labels']['trashed']:
                 # print '\tAlready in trash: ' + item['title'] + ' - ' + item['id']
                 pass
             else:
-                print '\tTrashing: ' + item['title'] + ' - ' + item['id']
+                print '\tTrashing: ' + item['title'] + ' - ' + item['id'] + ' - ' + str(len(self.orphans) - self.trashed) + ' orphans left'
                 try:
                     self.drive.files().trash(fileId=item['id']).execute()
                     self.trashed += 1
                 except:
                     print '\t\t>>> ERROR TRASHING THIS FILE <<<'
                     self.errors += 1
-        self.updateFiles()
         print str(self)
 
     def moveItems(self, folder, reload_files=False):
@@ -133,18 +120,18 @@ class DriveCleaner():
 
         Arguments:
             folder (string): the id of the target folder
-            reload_files (bool): optional, updateFiles before running the move
+            reload_files (bool): optional, findOrphans before running the move
         """
-        if len(self.files) == 0 or reload_files:
-            self.updateFiles()
+        if len(self.orphans) == 0 or reload_files:
+            self.findOrphans()
         #find items we want to move
-        for item in self.noParentsMine() + self.deadParentsMine():
+        for item in self.orphans:
             # ... check to see if already trashed
             if item['labels'] and item['labels']['trashed']:
                 # print '\tAlready in trash: ' + item['title'] + ' - ' + item['id']
                 pass
             else:
-                print '\tMoving: ' + item['title'] + ' - ' + item['id']
+                print '\tMoving: ' + item['title'] + ' - ' + item['id'] + ' - ' + str(len(self.orphans) - self.moved) + ' orphans left'
                 try:
                     self.drive.parents().insert(fileId=item['id'], body={'id': folder}).execute()
                     self.moved += 1
@@ -152,19 +139,17 @@ class DriveCleaner():
                     print '\t\t>>> ERROR MOVING THIS FILE <<<'
                     print '%s' % error
                     self.errors += 1
-        self.updateFiles()
         print str(self)
         
     def countFiles(self, folder):
         keep_going = True
         next_token = None
 
-        self.files = []
-        self.requests = 0
-        self.total = 0
+        requests = 0
+        total = 0
         while keep_going:
             self.requests += 1
-            print 'Making request ' + str(self.requests) + ' total files so far ' + str(self.total)
+            print 'Making request ' + str(requests) + ' total files so far ' + str(total)
             f = children = self.drive.children().list(folderId=folder, maxResults=1000, pageToken=next_token).execute()
             try:
                 next_token = f['nextPageToken']
@@ -173,8 +158,8 @@ class DriveCleaner():
                 keep_going = False
             except:
                 print "Unexpected error:", sys.exc_info()[0]
-            self.total += len(f['items'])
-            print 'Total Files: ' + str(self.total)
+            total += len(f['items'])
+            print 'Total Files: ' + str(total)
 
 def get_credentials():
     try:
